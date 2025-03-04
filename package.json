@@ -1,0 +1,9 @@
+{
+  "name": "markdown-web-scraper",
+  "version": "1.0.0",
+  "description": "Web scraper that outputs markdown files",
+  "main": "web-scraper-markdown.js",
+  "dependencies": {
+    "puppeteer": "^19.7.0"
+  }
+}
