@@ -5,11 +5,29 @@ const path = require('path');
 const url = require('url');
 
 /**
+ * URLからフラグメント（#以降）を除去する関数
+ * @param {string} urlString URL文字列
+ * @returns {string} フラグメントを除去したURL
+ */
+function removeFragment(urlString) {
+  try {
+    const parsedUrl = new URL(urlString);
+    parsedUrl.hash = '';
+    return parsedUrl.toString();
+  } catch (e) {
+    return urlString;
+  }
+}
+
+/**
  * ウェブページをスクレイピングしてマークダウン形式で保存する
  * @param {string} targetUrl スクレイピング対象のURL
  * @param {number} maxDepth 最大探索深度
  */
 async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
+  // フラグメントを除去した対象URLを使用
+  targetUrl = removeFragment(targetUrl);
+  
   console.log(`スクレイピングを開始: ${targetUrl} (最大深度: ${maxDepth})`);
   
   // 出力ディレクトリの設定
@@ -31,10 +49,14 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
     markdownFiles: 0
   };
   
-  // 訪問済みURLの記録
+  // 訪問済みURLの記録 (フラグメントなしで保存)
   const visitedUrls = new Set();
   // 処理待ちURLのキュー (URL, 深度)
   const urlQueue = [[targetUrl, 0]];
+  
+  // オリジナルURLとフラグメント除去後のURLのマッピング
+  const originalUrls = new Map();
+  originalUrls.set(targetUrl, targetUrl);
   
   // ブラウザを起動
   const browser = await puppeteer.launch({
@@ -47,8 +69,11 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
       // URLキューから次の処理対象を取得
       const [currentUrl, depth] = urlQueue.shift();
       
+      // フラグメントを除去したURLを使用
+      const normalizedUrl = removeFragment(currentUrl);
+      
       // 既に訪問済みの場合はスキップ
-      if (visitedUrls.has(currentUrl)) {
+      if (visitedUrls.has(normalizedUrl)) {
         continue;
       }
       
@@ -59,8 +84,11 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
       
       console.log(`処理中 [深度: ${depth}]: ${currentUrl}`);
       
-      // URLを訪問済みに追加
-      visitedUrls.add(currentUrl);
+      // URLを訪問済みに追加 (フラグメントなしで)
+      visitedUrls.add(normalizedUrl);
+      // オリジナルURLも保存（レポート用）
+      originalUrls.set(normalizedUrl, currentUrl);
+      
       metadata.pagesScraped++;
       
       // ページを開く
@@ -68,7 +96,7 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36');
       
       try {
-        // ページに移動
+        // ページに移動（オリジナルURLを使用）
         await page.goto(currentUrl, {
           waitUntil: 'networkidle2',
           timeout: 60000
@@ -87,7 +115,7 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
         const markdown = await extractContentAsMarkdown(page, imagesDir, currentUrl);
         
         // マークダウンファイル名の作成
-        const parsedUrl = new URL(currentUrl);
+        const parsedUrl = new URL(normalizedUrl);
         let fileName = parsedUrl.pathname.replace(/\//g, '_').replace(/^_/, '');
         if (!fileName) fileName = 'index';
         if (!fileName.endsWith('.md')) fileName += '.md';
@@ -96,6 +124,7 @@ async function scrapeToMarkdown(targetUrl, maxDepth = 2) {
         const frontMatter = `---
 title: "${pageMetadata.title}"
 url: "${currentUrl}"
+normalizedUrl: "${normalizedUrl}"
 description: "${pageMetadata.description}"
 date: "${new Date().toISOString()}"
 depth: ${depth}
@@ -137,14 +166,16 @@ depth: ${depth}
             
             return Array.from(document.querySelectorAll('a[href]'))
               .map(a => a.href)
-              .filter(href => href && !href.startsWith('#') && !href.startsWith('javascript:') && !href.startsWith('mailto:'))
+              .filter(href => href && !href.startsWith('javascript:') && !href.startsWith('mailto:'))
               .filter(href => sameDomain(href));
           }, currentUrl);
           
           // 重複を除去して新しいリンクをキューに追加
           const uniqueLinks = [...new Set(links)];
           for (const link of uniqueLinks) {
-            if (!visitedUrls.has(link)) {
+            // フラグメントを除去したURLで重複チェック
+            const normalizedLink = removeFragment(link);
+            if (!visitedUrls.has(normalizedLink)) {
               urlQueue.push([link, depth + 1]);
             }
           }
@@ -157,7 +188,7 @@ depth: ${depth}
     }
     
     // インデックスマークダウンを作成
-    await createIndexMarkdown(mdOutputDir, visitedUrls, metadata);
+    await createIndexMarkdown(mdOutputDir, visitedUrls, originalUrls, metadata);
     
     // メタデータ更新
     metadata.endTime = new Date().toISOString();
@@ -260,7 +291,7 @@ async function extractContentAsMarkdown(page, imagesDir, baseUrl) {
           return olItems ? `${olItems}\n` : '';
         case 'a':
           const href = element.getAttribute('href');
-          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+          if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:')) {
             // 相対URLを絶対URLに変換
             const absoluteUrl = new URL(href, baseUrl).href;
             return `[${cleanText(element.textContent)}](${absoluteUrl})`;
@@ -344,10 +375,11 @@ async function extractContentAsMarkdown(page, imagesDir, baseUrl) {
 /**
  * インデックスマークダウンファイルを作成
  * @param {string} outputDir 出力ディレクトリ
- * @param {Set<string>} visitedUrls 訪問済みURL
+ * @param {Set<string>} visitedUrls 訪問済みURL（フラグメントなし）
+ * @param {Map<string, string>} originalUrls オリジナルURLのマッピング
  * @param {Object} metadata メタデータ
  */
-async function createIndexMarkdown(outputDir, visitedUrls, metadata) {
+async function createIndexMarkdown(outputDir, visitedUrls, originalUrls, metadata) {
   console.log('インデックスページを作成中...');
   
   // インデックスマークダウンを作成
@@ -369,14 +401,17 @@ async function createIndexMarkdown(outputDir, visitedUrls, metadata) {
   const urls = Array.from(visitedUrls);
   urls.sort();
   
-  for (const url of urls) {
+  for (const normalizedUrl of urls) {
+    // オリジナルURLを取得（フラグメント付き）
+    const originalUrl = originalUrls.get(normalizedUrl) || normalizedUrl;
+    
     // URLからファイル名を生成
-    const parsedUrl = new URL(url);
+    const parsedUrl = new URL(normalizedUrl);
     let fileName = parsedUrl.pathname.replace(/\//g, '_').replace(/^_/, '');
     if (!fileName) fileName = 'index';
     if (!fileName.endsWith('.md')) fileName += '.md';
     
-    markdown += `- [${url}](./${fileName})\n`;
+    markdown += `- [${originalUrl}](./${fileName})\n`;
   }
   
   // インデックスマークダウンを保存
